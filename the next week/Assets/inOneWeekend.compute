@@ -1,0 +1,928 @@
+﻿#pragma kernel CSMain
+
+//#pragma exclude_renderers d3d11_9x
+//#pragma exclude_renderers d3d9
+
+Texture2D<float4> reader;
+RWTexture2D<float4> writer;
+float iFrame, iTime;
+ 
+#define MAX_FLOAT 1e5
+#define EPSILON 0.01
+
+
+#define LAMBERTIAN 0
+#define METAL 1
+#define DIELECTRIC 2
+#define DIFFUSE_LIGHT 3
+#define ISOTROPIC 4
+
+#define SPHERE 0
+#define MOVING_SPHERE 1
+#define BOX 2
+#define CONSTANT_MEDIUM_SPHERE 3
+#define CONSTANT_MEDIUM_BOX 4
+
+#define SOLID 0
+#define NOISE 1
+ 
+
+uint base_hash(float2 p) {
+	p = abs(p);
+	p.x = uint(1103515245) * ((uint(p.x) >> uint(1)) ^ uint(p.y));
+	p.y = uint(1103515245) * ((uint(p.y) >> uint(1)) ^ uint(p.x));
+
+	uint h32 = 1103515245U * (uint(p.x) ^ (uint(p.y) >> 3U));
+	return h32 ^ (h32 >> 16);
+}
+
+float g_seed = 0.;
+float seed;
+float3 refracted;
+float3 attenuation;
+float3 normal;
+float dist;
+
+float hash1( float tseed) {
+	uint n = base_hash(uint2(float2(tseed += .1, tseed += .1)));
+	seed = tseed;
+	return float(n) / float(0xffffffffU);
+}
+
+float2 hash2( float tseed) {
+	uint n = base_hash(float2(float2(tseed += .1, tseed += .1)));
+	float2 rz = abs(float2(n, n * 48271U));
+	float2 m;
+	m.x = float((uint(rz.x) & uint(float(2147483647))) / float(2147483647));
+	m.y = float((uint(rz.y) & uint(float(2147483647))) / float(2147483647));
+	seed = tseed;
+	return m;
+}
+
+
+float3 hash3( float tseed) {
+	uint n = base_hash(uint2(float2(tseed += .1, tseed += .1)));
+	float3 rz = uint3(float3(n, n * 16807U, n * 48271U));
+
+	float3 m;
+	m.x = float(uint(rz.x) & uint(float(2147483647))) / float(2147483647);
+	m.y = float(uint(rz.y) & uint(float(2147483647))) / float(2147483647);
+	m.z = float(uint(rz.z) & uint(float(2147483647))) / float(2147483647);
+	seed = tseed;
+
+	return m;
+}
+
+float hash(float3 p) {
+	p = frac(p*0.3183099 + .1);
+	p *= 17.0;
+	return 2. * frac(p.x*p.y*p.z*(p.x + p.y + p.z)) - 1.;
+}
+
+float noise(const float3 x) {
+	float3 p = floor(x);
+	float3 f = frac(x);
+	f = f * f*(3.0 - 2.0*f);
+
+	return lerp(lerp(lerp(hash(p + float3(0, 0, 0)),
+		hash(p + float3(1, 0, 0)), f.x),
+		lerp(hash(p + float3(0, 1, 0)),
+			hash(p + float3(1, 1, 0)), f.x), f.y),
+		lerp(lerp(hash(p + float3(0, 0, 1)),
+			hash(p + float3(1, 0, 1)), f.x),
+			lerp(hash(p + float3(0, 1, 1)),
+				hash(p + float3(1, 1, 1)), f.x), f.y), f.z);
+}
+
+float fbm(const float3 p, const int octaves) {
+	float accum = 0.;
+	float3 temp_p = p;
+	float weight = 1.;
+
+	for (int i = 0; i<octaves; i++) {
+		accum += weight * noise(temp_p);
+		weight *= .5;
+		temp_p *= 2.;
+	}
+	return abs(accum);
+}
+
+float schlick(float cosine, float ior) {
+	float r0 = (1. - ior) / (1. + ior);
+	r0 = r0 * r0;
+	return r0 + (1. - r0)*pow((1. - cosine), 5.);
+}
+
+bool modified_refract(const float3 v, const float3 n, const float ni_over_nt) {
+	float dt = dot(v, n);
+	float discriminant = 1. - ni_over_nt * ni_over_nt*(1. - dt * dt);
+	if (discriminant > 0.) {
+		refracted = ni_over_nt * (v - n * dt) - n * sqrt(discriminant);
+		return true;
+	}
+	else {
+		return false;
+	}
+}
+
+float3 random_cos_weighted_hemisphere_direction(const float3 n, float tseed) {
+	float2 r = hash2(tseed);
+	float3  uu = normalize(cross(n, abs(n.y) > .5 ? float3(1., 0., 0.) : float3(0., 1., 0.)));
+	float3  vv = cross(uu, n);
+	float ra = sqrt(r.y);
+	float rx = ra * cos(6.28318530718*r.x);
+	float ry = ra * sin(6.28318530718*r.x);
+	float rz = sqrt(1. - r.y);
+	float3  rr = float3(rx*uu + ry * vv + rz * n);
+	seed = tseed;
+	return normalize(rr);
+}
+
+float2 random_in_unit_disk( float tseed) {
+	float2 h = hash2(tseed) * float2(1., 6.28318530718);
+	float phi = h.y;
+	float r = sqrt(h.x);
+	seed = tseed;
+	return r * float2(sin(phi), cos(phi));
+}
+
+float3 random_in_unit_sphere( float tseed) {
+	float3 h = hash3(tseed) * float3(2., 6.28318530718, 1.) - float3(1, 0, 0);
+	float phi = h.y;
+	float r = pow(h.z, 1. / 3.);
+	seed = tseed;
+	return r * float3(sqrt(1. - h.x*h.x)*float2(sin(phi), cos(phi)), h.x);
+}
+
+float3 rotate_y(const float3 p, const float t) {
+	float co = cos(t);
+	float si = sin(t);
+	float2 xz = mul(float2x2(co, si, -si, co),p.xz);
+	return float3(xz.x, p.y, xz.y);
+} 
+
+struct ray {
+	float3 origin, direction;
+	float time;
+};
+
+ray scattered;
+
+ray ray_translate(const ray r, const float3 t) {
+	ray rt = r;
+	rt.origin -= t;
+	return rt;
+}
+
+ray ray_rotate_y(const ray r, const float t) {
+	ray rt = r;
+	rt.origin = rotate_y(rt.origin, t);
+	rt.direction = rotate_y(rt.direction, t);
+	return rt;
+} 
+
+struct texture_ {
+	int type;
+	float3 v;
+};
+
+float3 texture_value(const texture_ t, const float3 p) {
+	if (t.type == SOLID) {
+		return t.v;
+	}
+	else if (t.type == NOISE) {
+		return float3(.5*(1. + sin(t.v.x*p.x + 5.*fbm((t.v.x)*p, 7))), .5*(1. + sin(t.v.x*p.x + 5.*fbm((t.v.x)*p, 7))), .5*(1. + sin(t.v.x*p.x + 5.*fbm((t.v.x)*p, 7))));
+	}
+	else {
+		return float3(0, 0, 0);
+	}
+}
+ 
+struct material {
+	int type;
+	texture_ albedo;
+	texture_ emit;
+	float v;
+};
+ 
+
+struct hit_record {
+	float t;
+	float3 p, normal;
+	material mat;
+};
+
+hit_record rec;
+
+hit_record hit_record_translate(const hit_record h, const float3 t) {
+	hit_record ht = h;
+	ht.p -= t;
+	return ht;
+}
+
+hit_record hit_record_rotate_y(const hit_record h, const float t) {
+	hit_record ht = h;
+	ht.p = rotate_y(ht.p, t);
+	ht.normal = rotate_y(ht.normal, t);
+	return ht;
+}
+
+bool material_scatter(const ray r_in, const hit_record trec) {
+	if (trec.mat.type == LAMBERTIAN) {
+		
+		scattered.origin= trec.p;
+		scattered.direction= random_cos_weighted_hemisphere_direction(trec.normal, g_seed);
+		scattered.time= r_in.time;
+
+		attenuation = texture_value(trec.mat.albedo, trec.p);
+		return true;
+	}
+	else if (trec.mat.type == METAL) {
+		float3 rd = reflect(r_in.direction, trec.normal);
+
+		scattered.origin = trec.p;
+		scattered.direction = normalize(rd + trec.mat.v*random_in_unit_sphere(g_seed));
+		scattered.time = r_in.time;
+
+		attenuation = texture_value(trec.mat.albedo, trec.p);
+		return true;
+	}
+	else if (trec.mat.type == DIELECTRIC) {
+		float3 outward_normal,
+			reflected = reflect(r_in.direction, trec.normal);
+		float ni_over_nt, reflect_prob, cosine;
+
+		attenuation = float3(1,1,1);
+		if (dot(r_in.direction, trec.normal) > 0.) {
+			outward_normal = -trec.normal;
+			ni_over_nt = trec.mat.v;
+			cosine = dot(r_in.direction, trec.normal);
+			cosine = sqrt(1. - trec.mat.v*trec.mat.v*(1. - cosine * cosine));
+		}
+		else {
+			outward_normal = trec.normal;
+			ni_over_nt = 1. / trec.mat.v;
+			cosine = -dot(r_in.direction, trec.normal);
+		}
+
+		if (modified_refract(r_in.direction, outward_normal, ni_over_nt)) {
+			reflect_prob = schlick(cosine, trec.mat.v);
+		}
+		else {
+			reflect_prob = 1.;
+		}
+
+		if (hash1(g_seed) < reflect_prob) {
+			scattered.origin = trec.p;
+			scattered.direction = reflected;
+			scattered.time = r_in.time;
+		}
+		else {
+			scattered.origin = trec.p;
+			scattered.direction = refracted;
+			scattered.time = r_in.time;
+		}
+		return true;
+	}
+	else if (trec.mat.type == ISOTROPIC) {
+		 
+		scattered.origin = trec.p;
+		scattered.direction = random_in_unit_sphere(g_seed);
+		scattered.time = r_in.time;
+
+		attenuation = texture_value(trec.mat.albedo, trec.p);
+		return true;
+	}
+	else {
+		return false;
+	}
+
+	return false;
+}
+
+float3 material_emitted(const hit_record trec) {
+	if (trec.mat.type == DIFFUSE_LIGHT) {
+		return texture_value(trec.mat.emit, trec.p);
+	}
+	else {
+		return float3(0,0,0);
+	}
+}
+
+struct hitable {
+	int type;
+	float3 center, v3;	// v3 is speed for moving sphere (with center at t=0) or dimensions for box.
+	float v;			// Radius for sphere.
+};
+
+bool sphere_intersect(const ray r, const float t_min, const float t_max,
+	const float3 center, const float radius) {
+	float3 oc = r.origin - center;
+	float b = dot(oc, r.direction);
+	float c = dot(oc, oc) - radius * radius;
+	float discriminant = b * b - c;
+	if (discriminant < 0.0) return false;
+
+	float s = sqrt(discriminant);
+	float t1 = -b - s;
+	float t2 = -b + s;
+
+	float t = t1 < t_min ? t2 : t1;
+	if (t < t_max && t > t_min) {
+		dist = t;
+		return true;
+	}
+	else {
+		return false;
+	}
+}
+
+bool box_intersect(const ray r, const float t_min, const float t_max,
+	const float3 center, const float3 rad) {
+	/*float3 m = 1. / r.direction;
+	float3 n = m * (r.origin - center);
+	float3 k = abs(m)*rad;
+
+	float3 t1 = -n - k;
+	float3 t2 = -n + k;
+
+	float tN = max(max(t1.x, t1.y), t1.z);
+	float tF = min(min(t2.x, t2.y), t2.z);
+	
+	if (tN > tF || tF < 0.) {
+		return false;
+	}
+
+	float t = tN < t_min ? tF : tN;
+
+	if (t < t_max && t > t_min) {
+		dist = t;
+		normal = -sign(r.direction)*step(t1.yzx, t1.xyz)*step(t1.zxy, t1.xyz);
+		return true;
+	}
+	else {
+		return false;
+	}*/return false;
+}
+
+bool hitable_hit(const hitable hb, const ray r, const float t_min, const float t_max) {
+
+	if (hb.type == SPHERE || hb.type == MOVING_SPHERE) {
+		float3 center = hb.type == SPHERE ? hb.center : hb.center + r.time * hb.v3;
+		float radius = hb.v;
+		
+		if (sphere_intersect(r, t_min, t_max, center, radius)) {
+			rec.t = dist;
+			rec.p = r.origin + dist * r.direction;
+			if (radius != 0.) {
+				radius = 1.;
+			}
+			rec.normal = (rec.p - center) / radius;
+			return true;
+		}
+		else {
+			return false;
+		}
+	}
+	else if (hb.type == BOX) { 
+		if (box_intersect(r, t_min, t_max, hb.center, hb.v3)) {
+			rec.t = dist;
+			rec.p = r.origin + dist * r.direction;
+			rec.normal = normal;
+			return true;
+		}
+		else {
+			return false;
+		}
+	}
+	else { // constant medium
+		bool h1, h2;
+		float t1 = 0, t2 = 0;
+
+		hit_record rec1, rec2;
+		if (hb.type == CONSTANT_MEDIUM_SPHERE) {
+			dist = t1;
+			h1 = sphere_intersect(r, -MAX_FLOAT, MAX_FLOAT, hb.center, hb.v3.x);
+			dist = t2;
+			h2 = sphere_intersect(r, t1 + EPSILON, MAX_FLOAT, hb.center, hb.v3.x);
+		}
+		else { // box
+			dist = t1;
+			h1 = box_intersect(r, -MAX_FLOAT, MAX_FLOAT, hb.center, hb.v3);
+			dist = t2;
+			h2 = box_intersect(r, t1 + EPSILON, MAX_FLOAT, hb.center, hb.v3);
+		}
+		if (h1 && h2) {
+			if (t1 < t_min) t1 = t_min;
+			if (t2 > t_max) t2 = t_max;
+			if (t1 >= t2) {
+				return false;
+			}
+			else {
+				if (t1 < 0.) t1 = 0.;
+
+				float distance_inside_boundary = t2 - t1;
+				float hit_distance = -(1. / hb.v)*log(hash1(g_seed));
+
+				if (hit_distance < distance_inside_boundary) {
+					rec.t = t1 + hit_distance;
+					rec.p = r.origin + r.direction * rec.t;
+					rec.normal = float3(1, 0, 0);  // arbitrary
+					return true;
+				}
+				else {
+					return false;
+				}
+			}
+		}
+		else {
+			return false;
+		}
+	}
+}
+
+bool hitable_hit_tmp(const hitable hb, const ray r, const float t_min, const float t_max, hit_record trec) {
+
+	if (hb.type == SPHERE || hb.type == MOVING_SPHERE) {
+		float3 center = hb.type == SPHERE ? hb.center : hb.center + r.time * hb.v3;
+		float radius = hb.v;
+		
+		if (sphere_intersect(r, t_min, t_max, center, radius)) {
+			trec.t = dist;
+			trec.p = r.origin + dist * r.direction;
+			trec.normal = (trec.p - center) / radius;
+			return true;
+		}
+		else {
+			return false;
+		}
+	}
+	else if (hb.type == BOX) {
+		if (box_intersect(r, t_min, t_max, hb.center, hb.v3)) {
+			trec.t = dist;
+			trec.p = r.origin + dist * r.direction;
+			trec.normal = normal;
+			return true;
+		}
+		else {
+			return false;
+		}
+	}
+	else { // constant medium
+		bool h1, h2;
+		float t1, t2;
+		if (hb.type == CONSTANT_MEDIUM_SPHERE) {
+			dist = t1;
+			h1 = sphere_intersect(r, -MAX_FLOAT, MAX_FLOAT, hb.center, hb.v3.x);
+			dist = t2;
+			h2 = sphere_intersect(r, t1 + EPSILON, MAX_FLOAT, hb.center, hb.v3.x);
+		}
+		else { // box
+			dist = t1;
+			h1 = box_intersect(r, -MAX_FLOAT, MAX_FLOAT, hb.center, hb.v3);
+			dist = t2;
+			h2 = box_intersect(r, t1 + EPSILON, MAX_FLOAT, hb.center, hb.v3);
+		}
+		if (h1 && h2) {
+			if (t1 < t_min) t1 = t_min;
+			if (t2 > t_max) t2 = t_max;
+			if (t1 >= t2) {
+				return false;
+			}
+			else {
+				if (t1 < 0.) t1 = 0.;
+
+				float distance_inside_boundary = t2 - t1;
+				float hit_distance = -(1. / hb.v)*log(hash1(g_seed));
+
+				if (hit_distance < distance_inside_boundary) {
+					trec.t = t1 + hit_distance;
+					trec.p = r.origin + r.direction * trec.t;
+					trec.normal = float3(1, 0, 0);  // arbitrary
+					return true;
+				}
+				else {
+					return false;
+				}
+			}
+		}
+		else {
+			return false;
+		}
+	}
+}
+
+struct camera {
+	float3 origin, lower_left_corner, horizontal, vertical, u, v, w;
+	float time0, time1, lens_radius;
+};
+
+camera camera_const(const float3 lookfrom, const float3 lookat, const float3 vup,
+	const float vfov, const float aspect, const float aperture,
+	const float focus_dist, const float time0, const float time1) {
+	camera cam;
+	cam.lens_radius = aperture / 2.;
+	float theta = vfov * 3.14159265359 / 180.;
+	float half_height = tan(theta / 2.);
+	float half_width = aspect * half_height;
+	cam.origin = lookfrom;
+	cam.w = normalize(lookfrom - lookat);
+	cam.u = normalize(cross(vup, cam.w));
+	cam.v = cross(cam.w, cam.u);
+	cam.lower_left_corner = cam.origin - half_width * focus_dist*cam.u - half_height * focus_dist*cam.v - focus_dist * cam.w;
+	cam.horizontal = 2.*half_width*focus_dist*cam.u;
+	cam.vertical = 2.*half_height*focus_dist*cam.v;
+	cam.time0 = time0;
+	cam.time1 = time1;
+	return cam;
+}
+
+ray camera_get_ray(camera c, float2 uv) {
+	float2 rd = c.lens_radius*random_in_unit_disk(g_seed);
+	float3 offset = c.u * rd.x + c.v * rd.y;
+
+	ray tmpray;
+	tmpray.origin = c.origin + offset;
+	tmpray.direction = normalize(c.lower_left_corner + uv.x*c.horizontal + uv.y*c.vertical - c.origin - offset);
+	tmpray.time = lerp(c.time0, c.time1, hash1(g_seed));
+
+	return tmpray;
+}
+ 
+
+bool world_hit(const ray r, const float t_min, const float t_max) {
+	rec.t = t_max;
+	bool hit = false;
+
+	hitable hitable1;
+	hitable1.type = BOX;
+	hitable1.center = float3(273, 555, 279.5);
+	hitable1.v3 = float3(150, .1, 132.5);
+	hitable1.v = 0.;
+
+	material material1;
+	material1.type = DIFFUSE_LIGHT;
+	material1.albedo.type = SOLID;
+	material1.albedo.v = float3(0, 0, 0);
+	material1.emit.type = SOLID;
+	material1.emit.v = float3(7, 7, 7);
+	material1.v = 0.;
+
+	if (hitable_hit(hitable1, r, t_min, rec.t))
+		hit = true, rec.mat = material1;
+
+	hitable hitable2;
+	hitable2.type = MOVING_SPHERE;
+	hitable2.center = float3(400, 400, 200);
+	hitable2.v3 = float3(30, 0, 0);
+	hitable2.v = 50.;
+
+	material material2;
+	material2.type = LAMBERTIAN;
+	material2.albedo.type = SOLID;
+	material2.albedo.v = float3(.7, .3, .1);
+	material2.emit.type = SOLID;
+	material2.emit.v = float3(0, 0, 0);
+	material2.v = 0.;
+
+	if (hitable_hit(hitable2, r, t_min, rec.t))
+		hit = true, rec.mat = material2;
+
+	hitable hitable3;
+	hitable3.type = SPHERE;
+	hitable3.center = float3(260, 150, 45);
+	hitable3.v3 = float3(0, 0, 0);
+	hitable3.v = 50.;
+
+	material material3;
+	material3.type = DIELECTRIC;
+	material3.albedo.type = SOLID;
+	material3.albedo.v = float3(0, 0, 0);
+	material3.emit.type = SOLID;
+	material3.emit.v = float3(0, 0, 0);
+	material3.v = 1.5;
+
+	if (hitable_hit(hitable3, r, t_min, rec.t))
+		hit = true, rec.mat = material3;
+
+	hitable hitable4;
+	hitable4.type = SPHERE;
+	hitable4.center = float3(0, 150, 145);
+	hitable4.v3 = float3(0, 0, 0);
+	hitable4.v = 50.;
+
+	material material4;
+	material4.type = METAL;
+	material4.albedo.type = SOLID;
+	material4.albedo.v = float3(.8, .8, .9);
+	material4.emit.type = SOLID;
+	material4.emit.v = float3(0, 0, 0);
+	material4.v = 1.;
+
+	if (hitable_hit(hitable4, r, t_min, rec.t))
+		hit = true, rec.mat = material4;
+
+	hitable hitable5;
+	hitable5.type = SPHERE;
+	hitable5.center = float3(220, 280, 300);
+	hitable5.v3 = float3(0, 0, 0);
+	hitable5.v = 80.;
+
+	material material5;
+	material5.type = LAMBERTIAN;
+	material5.albedo.type = NOISE;
+	material5.albedo.v = float3(.1, .1, .1);
+	material5.emit.type = SOLID;
+	material5.emit.v = float3(0, 0, 0);
+	material5.v = .1;
+
+	if (hitable_hit(hitable5, r, t_min, rec.t))
+		hit = true, rec.mat = material5;
+
+	hitable hitable6;
+	hitable6.type = SPHERE;
+	hitable6.center = float3(360, 150, 145);
+	hitable6.v3 = float3(0, 0, 0);
+	hitable6.v = 70.;
+
+	material material6;
+	material6.type = DIELECTRIC;
+	material6.albedo.type = SOLID;
+	material6.albedo.v = float3(0, 0, 0);
+	material6.emit.type = SOLID;
+	material6.emit.v = float3(0, 0, 0);
+	material6.v = 1.5;
+
+	if (hitable_hit(hitable6, r, t_min, rec.t))
+		hit = true, rec.mat = material6;
+
+	hitable hitable7;
+	hitable7.type = CONSTANT_MEDIUM_SPHERE;
+	hitable7.center = float3(360, 150, 145);
+	hitable7.v3 = float3(70, 70, 70);
+	hitable7.v = .2;
+
+	material material7;
+	material7.type = ISOTROPIC;
+	material7.albedo.type = SOLID;
+	material7.albedo.v = float3(.2, .4, .9);
+	material7.emit.type = SOLID;
+	material7.emit.v = float3(0, 0, 0);
+	material7.v = 0.;
+
+	if (hitable_hit(hitable7, r, t_min, rec.t))
+		hit = true, rec.mat = material7;
+
+	hitable hitable8;
+	hitable8.type = SPHERE;
+	hitable8.center = float3(400, 200, 400);
+	hitable8.v3 = float3(0, 0, 0);
+	hitable8.v = 100.;
+
+	material material8;
+	material8.type = DIELECTRIC;
+	material8.albedo.type = SOLID;
+	material8.albedo.v = float3(0, 0, 0);
+	material8.emit.type = SOLID;
+	material8.emit.v = float3(0, 0, 0);
+	material8.v = 1.04;
+
+	if (hitable_hit(hitable8, r, t_min, rec.t))
+		hit = true, rec.mat = material8;
+
+	hitable hitable9;
+	hitable9.type = CONSTANT_MEDIUM_SPHERE;
+	hitable9.center = float3(400, 200, 400);
+	hitable9.v3 = float3(100, 100, 100);
+	hitable9.v = .1;
+
+	material material9;
+	material9.type = ISOTROPIC;
+	material9.albedo.type = SOLID;
+	material9.albedo.v = float3(.4, .5, .7);
+	material9.emit.type = SOLID;
+	material9.emit.v = float3(0, 0, 0);
+	material9.v = 0.;
+
+	if (hitable_hit(hitable9, r, t_min, rec.t))
+		hit = true, rec.mat = material9;
+
+	hitable hitable10;
+	hitable10.type = CONSTANT_MEDIUM_SPHERE;
+	hitable10.center = float3(0, 0, 0);
+	hitable10.v3 = float3(1000, 1000, 1000);
+	hitable10.v = .0001;
+
+	material material10;
+	material10.type = ISOTROPIC;
+	material10.albedo.type = SOLID;
+	material10.albedo.v = float3(1, 1, 1);
+	material10.emit.type = SOLID;
+	material10.emit.v = float3(0, 0, 0);
+	material10.v = 0.;
+
+	if (hitable_hit(hitable10, r, t_min, rec.t))
+		hit = true, rec.mat = material10;
+
+	
+
+	// A 2D grid for the ground and a 3D grid for the cube with spheres are implemented as an optimization    
+
+	// cube with spheres
+	ray r_ = ray_rotate_y(ray_translate(r, float3(-100, 270, 395) + 82.5), 15. / 180.*3.14159265359);
+	box_intersect(r_, EPSILON, MAX_FLOAT, float3(0, 0, 0), float3(100, 100, 100));
+	
+	if (box_intersect(r_, EPSILON, MAX_FLOAT, float3(0, 0, 0), float3(100, 100, 100))) {
+		const float cubeGridScale = 20.;
+		float3 ro = r_.origin / cubeGridScale;
+		float3 pos = floor(ro + (all(1 - step(abs(r_.origin), float3(100, 100, 100))) ? EPSILON : dist)*r_.direction / cubeGridScale);
+		float3 rdi = 1. / r_.direction;
+		float3 rda = abs(rdi);
+		float3 rds = sign(r.direction);
+		float3 dis = (pos - ro + .5 + rds * .5) * rdi;
+		bool b_hit = false;
+
+		// traverse grid in 3D
+		float3 mm = float3(0, 0, 0);
+		int steps = 12;	//debug
+		for (int i = 0; i<steps; i++) {
+			for (float x = -1.; x <= 1.; x += 1.) {
+				for (float y = -1.; y <= 1.; y += 1.) {
+					for (float z = -1.; z <= 1.; z += 1.) {
+						float3 posc = pos + float3(x, y, z);
+						if (all(1 - step(abs(posc), float3(4.1, 4.1, 4.1)))) {
+							seed = dot(posc, float3(.1, .11, .111));
+							float3 scenter = posc * cubeGridScale + cubeGridScale * ((hash3(seed) - .5)*.75);
+							hit_record rec_ = rec;
+
+							hitable hitable11;
+							hitable11.type = SPHERE;
+							hitable11.center = scenter;
+							hitable11.v3 = float3(0, 0, 0);
+							hitable11.v = 10.;
+
+							material material11;
+							material11.type = LAMBERTIAN;
+							material11.albedo.type = SOLID;
+							material11.albedo.v = float3(.73, .73, .73);
+							material11.emit.type = SOLID;
+							material11.emit.v = float3(0, 0, 0);
+							material11.v = 0.;
+
+							if (hitable_hit_tmp(hitable11, r_, t_min, rec_.t, rec_))
+								b_hit = true,
+								rec = hit_record_translate(hit_record_rotate_y(rec_, -15. / 180.*3.14159265359), -82.5 - float3(-100, 270, 395)),
+								rec.mat = material11;
+						}
+					}
+				}
+			}
+
+			if (b_hit) {
+				hit = true;
+				break;
+			}
+
+			// step to next cell	
+			float3 mm = step(dis.xyz, dis.yxy) * step(dis.xyz, dis.zzx);
+			dis += mm * rda;
+			pos += mm * rds;
+		}
+	}
+
+	// floor     
+	if (r.origin.y < 101. || r.direction.y < 0.) {
+		const float floorGridScale = 100.;
+		float3 ro = r.origin / floorGridScale;
+		float2 pos = floor(ro.xz);
+		float3 rdi = 1. / r.direction;
+		float3 rda = abs(rdi);
+		float2 rds = sign(r.direction.xz);
+		float2 dis = (pos - ro.xz + .5 + rds * .5) * rdi.xz;
+		bool b_hit = false;
+
+		// traverse grid in 2D
+		float2 mm = float2(0, 0);
+		int steps = 26;
+		for (int i = 0; i<steps; i++) {
+			seed = dot(pos, float2(.7, .17));
+			float3 bcenter = float3(pos.x*floorGridScale + floorGridScale * .5, 0, pos.y*floorGridScale + .5*floorGridScale);
+			float3 bsize = float3(floorGridScale*.5, 100.*(hash1(seed) + 0.01), floorGridScale*.5);
+
+			hitable hitable12;
+			hitable12.type = BOX;
+			hitable12.center = bcenter;
+			hitable12.v3 = bsize;
+			hitable12.v = 0.;
+
+			material material12;
+			material12.type = LAMBERTIAN;
+			material12.albedo.type = SOLID;
+			material12.albedo.v = float3(.48, .83, .53);
+			material12.emit.type = SOLID;
+			material12.emit.v = float3(0, 0, 0);
+			material12.v = 0.;
+
+			if (hitable_hit(hitable12, r, t_min, rec.t))
+				b_hit = true, rec.mat = material12;
+
+			if (b_hit) {
+				hit = true;
+				break;
+			}
+
+			// step to next cell		
+			mm = step(dis.xy, dis.yx);
+			dis += mm * rda.xz;
+			pos += mm * rds;
+		}
+	}
+	return hit;
+}
+
+float3 color( ray r) {
+	float3 col = float3(0,0,0);
+	float3 emitted = float3(0,0,0);
+
+	for (int i = 0; i<24; i++) {
+		if (world_hit(r, EPSILON, MAX_FLOAT)) {
+			ray scattered;
+			float3 attenuation = float3(0,0,0);
+
+			float3 emit;
+			emit = material_emitted(rec);
+			
+			emitted += i == 0 ? emit : col * emit;
+
+			if (material_scatter(r, rec)) {
+				col = i == 0 ? attenuation : col * attenuation;
+				r = scattered;
+			}
+			else {
+				return emitted;
+			}
+		}
+		else {
+			return emitted;
+		}
+		if (dot(col, col) < 0.0001) return emitted; 
+	}
+	return emitted;
+}
+
+[numthreads(8, 8, 1)]
+void CSMain(uint2 id : SV_DispatchThreadID){
+	////////////////////
+	rec.t = 0;
+	rec.p = float3(0,0,0);
+	rec.normal = float3(0,0,0);
+	material mymat;
+	mymat.type = 1;
+	mymat.v = 0;
+	
+	texture_ myalbedo;
+	myalbedo.type=0;
+	myalbedo.v= float3(0,0,0);
+	texture_ myemit;
+	myemit.type = 0;
+	myemit.v = float3(0, 0, 0);
+	mymat.albedo = myalbedo;
+	mymat.emit = myemit;
+	rec.mat = mymat;
+	//////////////////////
+
+	float2 iResolution = float2(1024, 1024);
+	float2 frag_coord = float2(id.x, id.y);
+	float3 col = float3(0.0f, 0.0f, 0.0f);
+
+	if (frag_coord.x == 0 && frag_coord.y == 0) {
+		col = float3(1024, 1024, 1024);
+	}
+	else {
+		g_seed = float(base_hash(uint2(frag_coord))) / float(0xffffffffU) + iTime;
+
+		float2 uv = (frag_coord + hash2(g_seed)) / iResolution.xy;
+		float aspect = iResolution.x / iResolution.y;
+		float3 lookfrom = float3(478, 278, -600);
+		float3 lookat = float3(278, 278, 0);
+
+		camera cam = camera_const(lookfrom, lookat, float3(0, 1, 0), 40., aspect, 2.0, 800., 0., 1.);
+		ray r = camera_get_ray(cam, uv);
+		col = color(r);
+		int tmp = 1;
+		/*
+		if (texelFetch(iChannel0, ifloat2(0), 0).xy == iResolution.xy) {
+			frag_color = vec4(col, 1) + texelFetch(iChannel0, ifloat2(frag_coord), 0);
+		}
+		else {
+			frag_color = vec4(col, 1);
+		}
+		*/
+	}
+	 
+	//col /= float(NUMSAMPLES);
+	//col = float3(sqrt(col[0]), sqrt(col[1]), sqrt(col[2]));
+	//float4(clamp(col /float(iFrame + 1.0),0.0,1.0),1.0);
+
+	writer[id] = float4(col, 1.0f);  //float4(clamp(col / float(iFrame + 1.0), 0.0, 1.0), 1.0f);	 
+}
