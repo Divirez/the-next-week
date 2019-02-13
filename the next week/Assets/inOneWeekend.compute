@@ -1,11 +1,11 @@
 ﻿#pragma kernel CSMain
-
 //#pragma exclude_renderers d3d11_9x
 //#pragma exclude_renderers d3d9
 
 Texture2D<float4> reader;
 RWTexture2D<float4> writer;
 float iFrame, iTime;
+SamplerState _PointClamp;
  
 #define MAX_FLOAT 1e5
 #define EPSILON 0.01
@@ -27,15 +27,6 @@ float iFrame, iTime;
 #define NOISE 1
  
 
-uint base_hash(float2 p) {
-	p = abs(p);
-	p.x = uint(1103515245) * ((uint(p.x) >> uint(1)) ^ uint(p.y));
-	p.y = uint(1103515245) * ((uint(p.y) >> uint(1)) ^ uint(p.x));
-
-	uint h32 = 1103515245U * (uint(p.x) ^ (uint(p.y) >> 3U));
-	return h32 ^ (h32 >> 16);
-}
-
 float g_seed = 0.;
 float seed;
 float3 refracted;
@@ -43,35 +34,31 @@ float3 attenuation;
 float3 normal;
 float dist;
 
-float hash1( float tseed) {
-	uint n = base_hash(uint2(float2(tseed += .1, tseed += .1)));
+uint base_hash(uint2 p) {
+	p = 1103515245U * ((p >> 1U) ^ (p.yx));
+	uint h32 = 1103515245U * ((p.x) ^ (p.y >> 3U));
+	return h32 ^ (h32 >> 16);
+}
+ 
+float hash1(float tseed) {
+	uint n = base_hash(float2(tseed += .1, tseed += .1));
 	seed = tseed;
 	return float(n) / float(0xffffffffU);
 }
 
 float2 hash2( float tseed) {
-	uint n = base_hash(float2(float2(tseed += .1, tseed += .1)));
-	float2 rz = abs(float2(n, n * 48271U));
-	float2 m;
-	m.x = float((uint(rz.x) & uint(float(2147483647))) / float(2147483647));
-	m.y = float((uint(rz.y) & uint(float(2147483647))) / float(2147483647));
+	uint n = base_hash(float2(tseed += .1, tseed += .1));
 	seed = tseed;
-	return m;
+	uint2 rz = uint2(n, n * 48271U);
+	return float2(rz.xy & uint2(0x7fffffffU, 0x7fffffffU)) / float(0x7fffffff);
 }
-
 
 float3 hash3( float tseed) {
-	uint n = base_hash(uint2(float2(tseed += .1, tseed += .1)));
-	float3 rz = uint3(float3(n, n * 16807U, n * 48271U));
-
-	float3 m;
-	m.x = float(uint(rz.x) & uint(float(2147483647))) / float(2147483647);
-	m.y = float(uint(rz.y) & uint(float(2147483647))) / float(2147483647);
-	m.z = float(uint(rz.z) & uint(float(2147483647))) / float(2147483647);
-	seed = tseed;
-
-	return m;
+	uint n = base_hash(float2(tseed += .1, tseed += .1));
+	uint3 rz = uint3(n, n * 16807U, n * 48271U);
+	return float3(rz & uint3(0x7fffffffU, 0x7fffffffU, 0x7fffffffU)) / float(0x7fffffff);
 }
+ 
 
 float hash(float3 p) {
 	p = frac(p*0.3183099 + .1);
@@ -79,13 +66,13 @@ float hash(float3 p) {
 	return 2. * frac(p.x*p.y*p.z*(p.x + p.y + p.z)) - 1.;
 }
 
-float noise(const float3 x) {
+float noise( float3 x) {
 	float3 p = floor(x);
 	float3 f = frac(x);
 	f = f * f*(3.0 - 2.0*f);
 
 	return lerp(lerp(lerp(hash(p + float3(0, 0, 0)),
-		hash(p + float3(1, 0, 0)), f.x),
+			hash(p + float3(1, 0, 0)), f.x),
 		lerp(hash(p + float3(0, 1, 0)),
 			hash(p + float3(1, 1, 0)), f.x), f.y),
 		lerp(lerp(hash(p + float3(0, 0, 1)),
@@ -94,7 +81,7 @@ float noise(const float3 x) {
 				hash(p + float3(1, 1, 1)), f.x), f.y), f.z);
 }
 
-float fbm(const float3 p, const int octaves) {
+float fbm( float3 p,  int octaves) {
 	float accum = 0.;
 	float3 temp_p = p;
 	float weight = 1.;
@@ -113,7 +100,7 @@ float schlick(float cosine, float ior) {
 	return r0 + (1. - r0)*pow((1. - cosine), 5.);
 }
 
-bool modified_refract(const float3 v, const float3 n, const float ni_over_nt) {
+bool modified_refract( float3 v,  float3 n,  float ni_over_nt) {
 	float dt = dot(v, n);
 	float discriminant = 1. - ni_over_nt * ni_over_nt*(1. - dt * dt);
 	if (discriminant > 0.) {
@@ -125,7 +112,7 @@ bool modified_refract(const float3 v, const float3 n, const float ni_over_nt) {
 	}
 }
 
-float3 random_cos_weighted_hemisphere_direction(const float3 n, float tseed) {
+float3 random_cos_weighted_hemisphere_direction( float3 n, float tseed) {
 	float2 r = hash2(tseed);
 	float3  uu = normalize(cross(n, abs(n.y) > .5 ? float3(1., 0., 0.) : float3(0., 1., 0.)));
 	float3  vv = cross(uu, n);
@@ -154,7 +141,7 @@ float3 random_in_unit_sphere( float tseed) {
 	return r * float3(sqrt(1. - h.x*h.x)*float2(sin(phi), cos(phi)), h.x);
 }
 
-float3 rotate_y(const float3 p, const float t) {
+float3 rotate_y( float3 p,  float t) {
 	float co = cos(t);
 	float si = sin(t);
 	float2 xz = mul(float2x2(co, si, -si, co),p.xz);
@@ -168,13 +155,13 @@ struct ray {
 
 ray scattered;
 
-ray ray_translate(const ray r, const float3 t) {
+ray ray_translate( ray r,  float3 t) {
 	ray rt = r;
 	rt.origin -= t;
 	return rt;
 }
 
-ray ray_rotate_y(const ray r, const float t) {
+ray ray_rotate_y( ray r,  float t) {
 	ray rt = r;
 	rt.origin = rotate_y(rt.origin, t);
 	rt.direction = rotate_y(rt.direction, t);
@@ -186,7 +173,7 @@ struct texture_ {
 	float3 v;
 };
 
-float3 texture_value(const texture_ t, const float3 p) {
+float3 texture_value( texture_ t,  float3 p) {
 	if (t.type == SOLID) {
 		return t.v;
 	}
@@ -214,20 +201,20 @@ struct hit_record {
 
 hit_record rec;
 
-hit_record hit_record_translate(const hit_record h, const float3 t) {
+hit_record hit_record_translate( hit_record h,  float3 t) {
 	hit_record ht = h;
 	ht.p -= t;
 	return ht;
 }
 
-hit_record hit_record_rotate_y(const hit_record h, const float t) {
+hit_record hit_record_rotate_y( hit_record h,  float t) {
 	hit_record ht = h;
 	ht.p = rotate_y(ht.p, t);
 	ht.normal = rotate_y(ht.normal, t);
 	return ht;
 }
 
-bool material_scatter(const ray r_in, const hit_record trec) {
+bool material_scatter( ray r_in,  hit_record trec) {
 	if (trec.mat.type == LAMBERTIAN) {
 		
 		scattered.origin= trec.p;
@@ -300,7 +287,7 @@ bool material_scatter(const ray r_in, const hit_record trec) {
 	return false;
 }
 
-float3 material_emitted(const hit_record trec) {
+float3 material_emitted( hit_record trec) {
 	if (trec.mat.type == DIFFUSE_LIGHT) {
 		return texture_value(trec.mat.emit, trec.p);
 	}
@@ -315,8 +302,7 @@ struct hitable {
 	float v;			// Radius for sphere.
 };
 
-bool sphere_intersect(const ray r, const float t_min, const float t_max,
-	const float3 center, const float radius) {
+bool sphere_intersect( ray r,  float t_min,  float t_max, float3 center,  float radius) {
 	float3 oc = r.origin - center;
 	float b = dot(oc, r.direction);
 	float c = dot(oc, oc) - radius * radius;
@@ -337,9 +323,9 @@ bool sphere_intersect(const ray r, const float t_min, const float t_max,
 	}
 }
 
-bool box_intersect(const ray r, const float t_min, const float t_max,
-	const float3 center, const float3 rad) {
-	/*float3 m = 1. / r.direction;
+bool box_intersect( ray r,  float t_min,  float t_max,
+	 float3 center,  float3 rad) {
+	float3 m = 1. / r.direction;
 	float3 n = m * (r.origin - center);
 	float3 k = abs(m)*rad;
 
@@ -362,10 +348,10 @@ bool box_intersect(const ray r, const float t_min, const float t_max,
 	}
 	else {
 		return false;
-	}*/return false;
+	}
 }
 
-bool hitable_hit(const hitable hb, const ray r, const float t_min, const float t_max) {
+bool hitable_hit( hitable hb,  ray r,  float t_min,  float t_max) {
 
 	if (hb.type == SPHERE || hb.type == MOVING_SPHERE) {
 		float3 center = hb.type == SPHERE ? hb.center : hb.center + r.time * hb.v3;
@@ -399,7 +385,6 @@ bool hitable_hit(const hitable hb, const ray r, const float t_min, const float t
 		bool h1, h2;
 		float t1 = 0, t2 = 0;
 
-		hit_record rec1, rec2;
 		if (hb.type == CONSTANT_MEDIUM_SPHERE) {
 			dist = t1;
 			h1 = sphere_intersect(r, -MAX_FLOAT, MAX_FLOAT, hb.center, hb.v3.x);
@@ -441,7 +426,7 @@ bool hitable_hit(const hitable hb, const ray r, const float t_min, const float t
 	}
 }
 
-bool hitable_hit_tmp(const hitable hb, const ray r, const float t_min, const float t_max, hit_record trec) {
+bool hitable_hit_tmp( hitable hb,  ray r,  float t_min,  float t_max, hit_record trec) {
 
 	if (hb.type == SPHERE || hb.type == MOVING_SPHERE) {
 		float3 center = hb.type == SPHERE ? hb.center : hb.center + r.time * hb.v3;
@@ -517,9 +502,9 @@ struct camera {
 	float time0, time1, lens_radius;
 };
 
-camera camera_const(const float3 lookfrom, const float3 lookat, const float3 vup,
-	const float vfov, const float aspect, const float aperture,
-	const float focus_dist, const float time0, const float time1) {
+camera camera_const( float3 lookfrom,  float3 lookat,  float3 vup,
+	 float vfov,  float aspect,  float aperture,
+	 float focus_dist,  float time0,  float time1) {
 	camera cam;
 	cam.lens_radius = aperture / 2.;
 	float theta = vfov * 3.14159265359 / 180.;
@@ -548,19 +533,19 @@ ray camera_get_ray(camera c, float2 uv) {
 
 	return tmpray;
 }
- 
 
-bool world_hit(const ray r, const float t_min, const float t_max) {
+hitable hitable1, hitable2, hitable3, hitable4, hitable5, hitable6, hitable7, hitable8, hitable9, hitable10, hitable11, hitable12;
+material material1, material2, material3, material4, material5, material6, material7, material8, material9, material10, material11, material12;
+
+bool world_hit( ray r,  float t_min,  float t_max) {
 	rec.t = t_max;
 	bool hit = false;
 
-	hitable hitable1;
 	hitable1.type = BOX;
 	hitable1.center = float3(273, 555, 279.5);
 	hitable1.v3 = float3(150, .1, 132.5);
 	hitable1.v = 0.;
 
-	material material1;
 	material1.type = DIFFUSE_LIGHT;
 	material1.albedo.type = SOLID;
 	material1.albedo.v = float3(0, 0, 0);
@@ -571,13 +556,11 @@ bool world_hit(const ray r, const float t_min, const float t_max) {
 	if (hitable_hit(hitable1, r, t_min, rec.t))
 		hit = true, rec.mat = material1;
 
-	hitable hitable2;
 	hitable2.type = MOVING_SPHERE;
 	hitable2.center = float3(400, 400, 200);
 	hitable2.v3 = float3(30, 0, 0);
 	hitable2.v = 50.;
 
-	material material2;
 	material2.type = LAMBERTIAN;
 	material2.albedo.type = SOLID;
 	material2.albedo.v = float3(.7, .3, .1);
@@ -588,13 +571,11 @@ bool world_hit(const ray r, const float t_min, const float t_max) {
 	if (hitable_hit(hitable2, r, t_min, rec.t))
 		hit = true, rec.mat = material2;
 
-	hitable hitable3;
 	hitable3.type = SPHERE;
 	hitable3.center = float3(260, 150, 45);
 	hitable3.v3 = float3(0, 0, 0);
 	hitable3.v = 50.;
 
-	material material3;
 	material3.type = DIELECTRIC;
 	material3.albedo.type = SOLID;
 	material3.albedo.v = float3(0, 0, 0);
@@ -605,13 +586,11 @@ bool world_hit(const ray r, const float t_min, const float t_max) {
 	if (hitable_hit(hitable3, r, t_min, rec.t))
 		hit = true, rec.mat = material3;
 
-	hitable hitable4;
 	hitable4.type = SPHERE;
 	hitable4.center = float3(0, 150, 145);
 	hitable4.v3 = float3(0, 0, 0);
 	hitable4.v = 50.;
 
-	material material4;
 	material4.type = METAL;
 	material4.albedo.type = SOLID;
 	material4.albedo.v = float3(.8, .8, .9);
@@ -622,13 +601,11 @@ bool world_hit(const ray r, const float t_min, const float t_max) {
 	if (hitable_hit(hitable4, r, t_min, rec.t))
 		hit = true, rec.mat = material4;
 
-	hitable hitable5;
 	hitable5.type = SPHERE;
 	hitable5.center = float3(220, 280, 300);
 	hitable5.v3 = float3(0, 0, 0);
 	hitable5.v = 80.;
 
-	material material5;
 	material5.type = LAMBERTIAN;
 	material5.albedo.type = NOISE;
 	material5.albedo.v = float3(.1, .1, .1);
@@ -639,13 +616,11 @@ bool world_hit(const ray r, const float t_min, const float t_max) {
 	if (hitable_hit(hitable5, r, t_min, rec.t))
 		hit = true, rec.mat = material5;
 
-	hitable hitable6;
 	hitable6.type = SPHERE;
 	hitable6.center = float3(360, 150, 145);
 	hitable6.v3 = float3(0, 0, 0);
 	hitable6.v = 70.;
 
-	material material6;
 	material6.type = DIELECTRIC;
 	material6.albedo.type = SOLID;
 	material6.albedo.v = float3(0, 0, 0);
@@ -656,13 +631,11 @@ bool world_hit(const ray r, const float t_min, const float t_max) {
 	if (hitable_hit(hitable6, r, t_min, rec.t))
 		hit = true, rec.mat = material6;
 
-	hitable hitable7;
 	hitable7.type = CONSTANT_MEDIUM_SPHERE;
 	hitable7.center = float3(360, 150, 145);
 	hitable7.v3 = float3(70, 70, 70);
 	hitable7.v = .2;
 
-	material material7;
 	material7.type = ISOTROPIC;
 	material7.albedo.type = SOLID;
 	material7.albedo.v = float3(.2, .4, .9);
@@ -673,13 +646,11 @@ bool world_hit(const ray r, const float t_min, const float t_max) {
 	if (hitable_hit(hitable7, r, t_min, rec.t))
 		hit = true, rec.mat = material7;
 
-	hitable hitable8;
 	hitable8.type = SPHERE;
 	hitable8.center = float3(400, 200, 400);
 	hitable8.v3 = float3(0, 0, 0);
 	hitable8.v = 100.;
 
-	material material8;
 	material8.type = DIELECTRIC;
 	material8.albedo.type = SOLID;
 	material8.albedo.v = float3(0, 0, 0);
@@ -690,13 +661,11 @@ bool world_hit(const ray r, const float t_min, const float t_max) {
 	if (hitable_hit(hitable8, r, t_min, rec.t))
 		hit = true, rec.mat = material8;
 
-	hitable hitable9;
 	hitable9.type = CONSTANT_MEDIUM_SPHERE;
 	hitable9.center = float3(400, 200, 400);
 	hitable9.v3 = float3(100, 100, 100);
 	hitable9.v = .1;
 
-	material material9;
 	material9.type = ISOTROPIC;
 	material9.albedo.type = SOLID;
 	material9.albedo.v = float3(.4, .5, .7);
@@ -707,13 +676,11 @@ bool world_hit(const ray r, const float t_min, const float t_max) {
 	if (hitable_hit(hitable9, r, t_min, rec.t))
 		hit = true, rec.mat = material9;
 
-	hitable hitable10;
 	hitable10.type = CONSTANT_MEDIUM_SPHERE;
 	hitable10.center = float3(0, 0, 0);
 	hitable10.v3 = float3(1000, 1000, 1000);
 	hitable10.v = .0001;
 
-	material material10;
 	material10.type = ISOTROPIC;
 	material10.albedo.type = SOLID;
 	material10.albedo.v = float3(1, 1, 1);
@@ -730,10 +697,12 @@ bool world_hit(const ray r, const float t_min, const float t_max) {
 
 	// cube with spheres
 	ray r_ = ray_rotate_y(ray_translate(r, float3(-100, 270, 395) + 82.5), 15. / 180.*3.14159265359);
-	box_intersect(r_, EPSILON, MAX_FLOAT, float3(0, 0, 0), float3(100, 100, 100));
-	
+	 
+	normal = float3(0, 0, 0);
+	dist = float(0);
+
 	if (box_intersect(r_, EPSILON, MAX_FLOAT, float3(0, 0, 0), float3(100, 100, 100))) {
-		const float cubeGridScale = 20.;
+		 float cubeGridScale = 20.;
 		float3 ro = r_.origin / cubeGridScale;
 		float3 pos = floor(ro + (all(1 - step(abs(r_.origin), float3(100, 100, 100))) ? EPSILON : dist)*r_.direction / cubeGridScale);
 		float3 rdi = 1. / r_.direction;
@@ -741,11 +710,12 @@ bool world_hit(const ray r, const float t_min, const float t_max) {
 		float3 rds = sign(r.direction);
 		float3 dis = (pos - ro + .5 + rds * .5) * rdi;
 		bool b_hit = false;
-
+		
 		// traverse grid in 3D
 		float3 mm = float3(0, 0, 0);
-		int steps = 12;	//debug
+		int steps = 12+iFrame;	//debug
 		for (int i = 0; i<steps; i++) {
+			
 			for (float x = -1.; x <= 1.; x += 1.) {
 				for (float y = -1.; y <= 1.; y += 1.) {
 					for (float z = -1.; z <= 1.; z += 1.) {
@@ -755,13 +725,11 @@ bool world_hit(const ray r, const float t_min, const float t_max) {
 							float3 scenter = posc * cubeGridScale + cubeGridScale * ((hash3(seed) - .5)*.75);
 							hit_record rec_ = rec;
 
-							hitable hitable11;
 							hitable11.type = SPHERE;
 							hitable11.center = scenter;
 							hitable11.v3 = float3(0, 0, 0);
 							hitable11.v = 10.;
 
-							material material11;
 							material11.type = LAMBERTIAN;
 							material11.albedo.type = SOLID;
 							material11.albedo.v = float3(.73, .73, .73);
@@ -777,7 +745,7 @@ bool world_hit(const ray r, const float t_min, const float t_max) {
 					}
 				}
 			}
-
+			
 			if (b_hit) {
 				hit = true;
 				break;
@@ -789,10 +757,10 @@ bool world_hit(const ray r, const float t_min, const float t_max) {
 			pos += mm * rds;
 		}
 	}
-
+	
 	// floor     
 	if (r.origin.y < 101. || r.direction.y < 0.) {
-		const float floorGridScale = 100.;
+		 float floorGridScale = 100.;
 		float3 ro = r.origin / floorGridScale;
 		float2 pos = floor(ro.xz);
 		float3 rdi = 1. / r.direction;
@@ -803,19 +771,17 @@ bool world_hit(const ray r, const float t_min, const float t_max) {
 
 		// traverse grid in 2D
 		float2 mm = float2(0, 0);
-		int steps = 26;
-		for (int i = 0; i<steps; i++) {
+		int steps2 = 26+iFrame;
+		for (int i = 0; i<steps2; i++) {
 			seed = dot(pos, float2(.7, .17));
 			float3 bcenter = float3(pos.x*floorGridScale + floorGridScale * .5, 0, pos.y*floorGridScale + .5*floorGridScale);
 			float3 bsize = float3(floorGridScale*.5, 100.*(hash1(seed) + 0.01), floorGridScale*.5);
 
-			hitable hitable12;
 			hitable12.type = BOX;
 			hitable12.center = bcenter;
 			hitable12.v3 = bsize;
 			hitable12.v = 0.;
 
-			material material12;
 			material12.type = LAMBERTIAN;
 			material12.albedo.type = SOLID;
 			material12.albedo.v = float3(.48, .83, .53);
@@ -836,7 +802,8 @@ bool world_hit(const ray r, const float t_min, const float t_max) {
 			dis += mm * rda.xz;
 			pos += mm * rds;
 		}
-	}
+	} 
+
 	return hit;
 }
 
@@ -844,10 +811,15 @@ float3 color( ray r) {
 	float3 col = float3(0,0,0);
 	float3 emitted = float3(0,0,0);
 
-	for (int i = 0; i<24; i++) {
+	scattered.direction = float3(1, 1, 1);
+	scattered.origin = float3(1, 1, 1);
+	scattered.time = float(iTime);
+
+	for (int i = 0; i<24+iFrame; i++) {
 		if (world_hit(r, EPSILON, MAX_FLOAT)) {
-			ray scattered;
-			float3 attenuation = float3(0,0,0);
+			
+
+		    attenuation = float3(1,1,1);
 
 			float3 emit;
 			emit = material_emitted(rec);
@@ -873,33 +845,56 @@ float3 color( ray r) {
 [numthreads(8, 8, 1)]
 void CSMain(uint2 id : SV_DispatchThreadID){
 	////////////////////
-	rec.t = 0;
-	rec.p = float3(0,0,0);
-	rec.normal = float3(0,0,0);
+	rec.t = 0.;
+	rec.p = float3(0.,0.,0.);
+	rec.normal = float3(0.,0.,0.);
 	material mymat;
-	mymat.type = 1;
-	mymat.v = 0;
+	mymat.type = 0;
+	mymat.v = 0.;
 	
 	texture_ myalbedo;
-	myalbedo.type=0;
-	myalbedo.v= float3(0,0,0);
+	myalbedo.type=1;
+	myalbedo.v= float3(0.,0.,0.);
 	texture_ myemit;
 	myemit.type = 0;
-	myemit.v = float3(0, 0, 0);
+	myemit.v = float3(0., 0., 0.);
 	mymat.albedo = myalbedo;
 	mymat.emit = myemit;
 	rec.mat = mymat;
-	//////////////////////
-
+	
+	 
+	/* 1
 	float2 iResolution = float2(1024, 1024);
 	float2 frag_coord = float2(id.x, id.y);
 	float3 col = float3(0.0f, 0.0f, 0.0f);
+	 
+	g_seed = float(base_hash(frag_coord)) / float(0xffffffffU) + iTime;
+
+	float2 uv = (frag_coord + hash2(g_seed)) / iResolution.xy;
+	float aspect = iResolution.x / iResolution.y;
+	float3 lookfrom = float3(478, 278, -600);
+	float3 lookat = float3(278, 278, 0);
+
+	float2 st = frag_coord.xy / iResolution.xy;
+
+	camera cam = camera_const(lookfrom, lookat, float3(0, 1, 0), 40., aspect, 2.0, 800., 0., 1.);
+	ray r = camera_get_ray(cam, uv);
+	col = color(r);
+	col += reader.SampleLevel(_PointClamp, st, 0).rgb*iFrame;
+
+	writer[id] = float4(clamp(col / float(iFrame + 1.0), 0.0, 1.0), 1.0); 
+	*/ 
+
+	/*2
+	float2 frag_coord = float2(id.x, id.y);
+	float2 iResolution = float2(1024, 1024);
+	float2 st = frag_coord.xy / iResolution.xy;
 
 	if (frag_coord.x == 0 && frag_coord.y == 0) {
-		col = float3(1024, 1024, 1024);
+		writer[id] = iResolution.xyxy;
 	}
 	else {
-		g_seed = float(base_hash(uint2(frag_coord))) / float(0xffffffffU) + iTime;
+		g_seed = float(base_hash(frag_coord)) / float(0xffffffffU) + iTime;
 
 		float2 uv = (frag_coord + hash2(g_seed)) / iResolution.xy;
 		float aspect = iResolution.x / iResolution.y;
@@ -908,21 +903,36 @@ void CSMain(uint2 id : SV_DispatchThreadID){
 
 		camera cam = camera_const(lookfrom, lookat, float3(0, 1, 0), 40., aspect, 2.0, 800., 0., 1.);
 		ray r = camera_get_ray(cam, uv);
-		col = color(r);
-		int tmp = 1;
-		/*
-		if (texelFetch(iChannel0, ifloat2(0), 0).xy == iResolution.xy) {
-			frag_color = vec4(col, 1) + texelFetch(iChannel0, ifloat2(frag_coord), 0);
+		float3 col = color(r);
+
+		if (reader.SampleLevel(_PointClamp, st, 0).x == iResolution.x && reader.SampleLevel(_PointClamp, st, 0).y == iResolution.y) {
+			writer[id] = float4(col, 1) + reader.SampleLevel(_PointClamp, st, 0) / iFrame * 1024;
 		}
 		else {
-			frag_color = vec4(col, 1);
+			writer[id] = float4(col, 1);
 		}
-		*/
 	}
 	 
-	//col /= float(NUMSAMPLES);
-	//col = float3(sqrt(col[0]), sqrt(col[1]), sqrt(col[2]));
-	//float4(clamp(col /float(iFrame + 1.0),0.0,1.0),1.0);
+	writer[id] = reader.SampleLevel(_PointClamp, st, 0) / iFrame * 1024 + float4(sqrt(writer[id].xyz / iFrame*1024), 1.0);
+	*/
 
-	writer[id] = float4(col, 1.0f);  //float4(clamp(col / float(iFrame + 1.0), 0.0, 1.0), 1.0f);	 
+	float2 frag_coord = float2(id.x, id.y);
+	float2 iResolution = float2(1024, 1024);
+	float2 st = frag_coord.xy / iResolution.xy;
+ 
+	g_seed = float(base_hash(frag_coord)) / float(0xffffffffU) + iTime;
+
+	float2 uv = (frag_coord + hash2(g_seed)) / iResolution.xy;
+	float aspect = iResolution.x / iResolution.y;
+	float3 lookfrom = float3(478, 278, -600);
+	float3 lookat = float3(278, 278, 0);
+
+	camera cam = camera_const(lookfrom, lookat, float3(0, 1, 0), 40., aspect, 2.0, 800., 0., 1.);
+	ray r = camera_get_ray(cam, uv);
+	float3 col = color(r);
+
+	 
+	writer[id] = float4(col/iFrame, 1) + reader.SampleLevel(_PointClamp, st, 0);
+	 
+	 
 }
